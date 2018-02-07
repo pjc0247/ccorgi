@@ -1,15 +1,31 @@
-﻿using Newtonsoft.Json;
-using System;
+﻿using System;
+using System.IO;
 using System.Collections;
 using System.Collections.Generic;
-using System.IO;
+using System.Threading;
+
 using UnityEngine;
+using Newtonsoft.Json;
 
 public delegate void FallbackAction(string url, int version, ResolveAction resolve);
 public delegate void ResolveAction(Texture2D tex);
 
 public class Corgi : MonoBehaviour
 {
+    private const string IndexFilename = "corgi_init_data.json";
+
+    private class CacheHandle
+    {
+        public AutoResetEvent waitEvent;
+        public CorgiCacheState state;
+
+        public CacheHandle()
+        {
+            waitEvent = new AutoResetEvent(false);
+            state = CorgiCacheState.None;
+        }
+    }
+
     private static Corgi _instance;
     public static Corgi instance
     {
@@ -17,14 +33,16 @@ public class Corgi : MonoBehaviour
         {
             if (_instance == null)
             {
-                var go = new GameObject("IMAGE_CACHE");
+                var go = new GameObject("CORGI_CACHE");
                 _instance = go.AddComponent<Corgi>();
             }
             return _instance;
         }
     }
 
-    const string INIT_DATA_PATH = "corgi_init_data.json";
+    private int mainThreadId;
+    private Dictionary<string, CacheHandle> handles;
+    private List<Action> mainThreadTasks;
 
     CorgiDisk disk;
     CorgiMemory memory;
@@ -36,14 +54,17 @@ public class Corgi : MonoBehaviour
     {
         if(_instance == null)
             _instance = this;
-
         DontDestroyOnLoad(this);
+
+        mainThreadId = Thread.CurrentThread.ManagedThreadId;
+        handles = new Dictionary<string, CacheHandle>();
+        mainThreadTasks = new List<Action>();
 
         disk = gameObject.AddComponent<CorgiDisk>();
         memory = gameObject.AddComponent<CorgiMemory>();
         web = gameObject.AddComponent<CorgiWeb>();
 
-        var path = Path.Combine(Application.persistentDataPath, INIT_DATA_PATH);
+        var path = Path.Combine(Application.persistentDataPath, IndexFilename);
         if (!File.Exists(path))
             return;
 
@@ -59,19 +80,48 @@ public class Corgi : MonoBehaviour
 
         disk.Init(initData);
     }
-
     void OnDestroy()
     {
+    }
+    void Update()
+    {
+
+    }
+
+    private void EnsureMainthread()
+    {
+        if (mainThreadId == Thread.CurrentThread.ManagedThreadId)
+            throw new InvalidOperationException("This function must be called in main thread.");
     }
 
     public static void Fetch(string url, int version, ResolveAction resolve)
     {
         instance._Fetch(url, version, resolve);
     }
-
     void _Fetch(string url, int version, ResolveAction resolve)
     {
-        memory.Load(url, version, resolve, OnMemoryFaield);
+        EnsureMainthread();
+
+        if (cacheState == CorgiCacheState.None ||
+            cacheState == CorgiCacheState.EndFetching)
+        {
+
+            if (cacheState == CorgiCacheState.None)
+                handles[url] = new CacheHandle();
+
+            memory.Load(url, version, resolve, OnMemoryFaield);
+        }
+        else
+        {
+            var handle = handles[url];
+            new Thread(() =>
+            {
+                handle.waitEvent.WaitOne(2000);
+                mainThreadTasks.Add(() => {
+                    memory.Load(url, version, resolve, OnMemoryFaield);
+                });
+            }).Start();
+        }
     }
 
     void OnMemoryFaield(string url, int version, ResolveAction resolve)
@@ -102,6 +152,7 @@ public class Corgi : MonoBehaviour
 
     void _Fallback(FallbackAction _fallback)
     {
+        EnsureMainthread();
         _fallback += _fallback;
     }
 
@@ -112,6 +163,7 @@ public class Corgi : MonoBehaviour
 
     void _Memorize(List<CorgiMemorize> memo)
     {
+        EnsureMainthread();
         foreach (var m in memo)
         {
             _Fetch(m.url, m.version, (tex) => { });
@@ -125,20 +177,19 @@ public class Corgi : MonoBehaviour
 
     public void _SaveData()
     {
+        EnsureMainthread();
+
         CorgiDiskData saveData = disk.GetData();
         if (saveData == null)
             return;
 
-        var path = Path.Combine(Application.persistentDataPath, INIT_DATA_PATH);
-        string content = JsonConvert.SerializeObject(saveData);
-        Debug.Log(content);
-        var t = new System.Threading.Thread(() =>
+        var path = Path.Combine(Application.persistentDataPath, IndexFilename);
+        var t = new Thread(() =>
         {
+            var content = JsonConvert.SerializeObject(saveData);
+            Debug.Log(content);
             File.WriteAllText(path, content);
         });
         t.Start();
     }
-
-
-
 }
